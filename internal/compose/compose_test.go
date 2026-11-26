@@ -87,6 +87,17 @@ func TestApplyEnvelope(t *testing.T) {
 	}
 }
 
+func TestApplyPromptInlineAudio(t *testing.T) {
+	p := Prompt{MIMEType: "audio/pcm;rate=16000", Data: "AQID"}
+	out, res, err := ApplyPrompt([]byte(envelope), p, Options{})
+	if err != nil || !res.Rewritten || !bytes.Contains(out, []byte(`"data":"AQID","mimeType":"audio/pcm;rate=16000"`)) {
+		t.Fatalf("bad inline rewrite: %+v %v", res, err)
+	}
+	if again, res2, _ := ApplyPrompt(out, p, Options{}); res2.Rewritten || !bytes.Equal(again, out) {
+		t.Fatalf("inline pass not idempotent: %+v", res2)
+	}
+}
+
 func TestApplySkips(t *testing.T) {
 	cases := map[string]string{
 		"other requestType": strings.Replace(envelope, `"requestType":"agent"`, `"requestType":"judge"`, 1),

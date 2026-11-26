@@ -15,6 +15,9 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +44,7 @@ const (
 	envScope   = "AGY_SP_SCOPE"         // "all" (default) or "main"
 	envTypes   = "AGY_SP_REQUEST_TYPES" // comma list, default "agent"
 	envDump    = "AGY_SP_DUMP"          // "1": write the last composed prompt to the state dir
+	envTempo   = "AGY_SP_AUDIO_TEMPO"   // ffmpeg atempo for audio prompts (default "2.0"; "1" disables)
 	envMarker  = "AGY_SP_PROXY"         // set in the child; detects our own proxy in HTTPS_PROXY
 	configName = "agy-sp.json"
 )
@@ -86,6 +90,12 @@ func main() {
 }
 
 func run() error {
+	home, _ := os.UserHomeDir()
+	stateDir := filepath.Join(home, ".gemini", "antigravity-cli", "agy-sp")
+	cfgPath := filepath.Join(home, ".gemini", "antigravity-cli", configName)
+	if len(os.Args) >= 2 && os.Args[1] == "sp" {
+		return runSP(os.Args[2:], home, stateDir, cfgPath)
+	}
 	real, err := realAgy()
 	if err != nil {
 		return err
@@ -94,8 +104,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	home, _ := os.UserHomeDir()
-	stateDir := filepath.Join(home, ".gemini", "antigravity-cli", "agy-sp")
 
 	promptPath := ""
 	switch {
@@ -104,7 +112,7 @@ func run() error {
 	case os.Getenv(envPrompt) != "":
 		promptPath = os.Getenv(envPrompt)
 	default:
-		promptPath, err = configPromptPath(filepath.Join(home, ".gemini", "antigravity-cli", configName))
+		promptPath, err = configPromptPath(cfgPath)
 		if err != nil {
 			return err
 		}
@@ -149,7 +157,7 @@ func run() error {
 				}
 				model = vertexModel(r.URL.Path)
 			}
-			out, res, err := compose.Apply(body, user, opts)
+			out, res, err := compose.ApplyPrompt(body, user, opts)
 			if !res.Rewritten {
 				if err != nil || res.Reason != "no systemInstruction" {
 					logf("skip %s shape=%s type=%q model=%s lead=%q: %s %v", r.URL.Path, res.Shape, res.RequestType, model, res.Lead, res.Reason, errOrEmpty(err))
@@ -172,7 +180,7 @@ func run() error {
 		return fmt.Errorf("start proxy: %w", err)
 	}
 	purl := "http://" + addr
-	logf("session start pid=%d proxy=%s prompt=%s (%d bytes) agy=%s", os.Getpid(), purl, promptPath, len(user), real)
+	logf("session start pid=%d proxy=%s prompt=%s (%d bytes) agy=%s", os.Getpid(), purl, promptPath, len(user.Text)+len(user.Data), real)
 	warnNoProxy(hosts)
 
 	env := withEnv(os.Environ(), map[string]string{
@@ -246,19 +254,161 @@ func configPromptPath(path string) (string, error) {
 	return c.SystemPromptFile, nil
 }
 
-func loadPrompt(path string) (string, error) {
+func saveConfigPromptPath(cfgPath, promptPath string) error {
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(struct {
+		SystemPromptFile string `json:"systemPromptFile"`
+	}{SystemPromptFile: promptPath}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return mitm.WriteFileAtomic(cfgPath, append(b, '\n'), 0o600)
+}
+
+func runSP(args []string, home, stateDir, cfgPath string) error {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+		args = args[1:]
+	}
+	switch sub {
+	case "status":
+		p, err := configPromptPath(cfgPath)
+		if err != nil {
+			return err
+		}
+		if p == "" {
+			fmt.Println("agy-sp: no configured system prompt (agy runs stock)")
+		} else {
+			kind := "markdown/text"
+			if audioExts[strings.ToLower(filepath.Ext(p))] {
+				kind = "audio"
+			}
+			fmt.Printf("agy-sp: %s (%s)\n", p, kind)
+		}
+		if env := os.Getenv(envPrompt); env != "" {
+			fmt.Printf("agy-sp: overridden by %s=%s\n", envPrompt, env)
+		}
+		return nil
+	case "clear", "off":
+		if err := os.Remove(cfgPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		fmt.Println("agy-sp: cleared (agy will run stock)")
+		return nil
+	case "set":
+		toAudio := false
+		if len(args) > 0 && args[0] == "--audio" {
+			toAudio = true
+			args = args[1:]
+		}
+		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+			return errors.New("usage: agy sp set [--audio] <path>")
+		}
+		target := expand(args[0], home)
+		if toAudio {
+			var err error
+			if target, err = synthesizePromptPCM(target, stateDir); err != nil {
+				return err
+			}
+		}
+		p, err := loadPrompt(target)
+		if err != nil {
+			return err
+		}
+		if err := saveConfigPromptPath(cfgPath, target); err != nil {
+			return err
+		}
+		if p.Inline() {
+			fmt.Printf("agy-sp: active audio prompt -> %s (%s)\n", target, p.MIMEType)
+		} else {
+			fmt.Printf("agy-sp: active text prompt -> %s (%d bytes)\n", target, len(p.Text))
+		}
+		return nil
+	default:
+		return errors.New("usage: agy sp [status | set [--audio] <path> | clear]")
+	}
+}
+
+func synthesizePromptPCM(mdPath, stateDir string) (string, error) {
+	p, err := loadPrompt(mdPath)
+	if err != nil {
+		return "", err
+	}
+	if p.Inline() {
+		return mdPath, nil
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", err
+	}
+	spoken := strings.NewReplacer("`system`", "", "`", "").Replace(p.Text)
+	tmpAIFF := filepath.Join(stateDir, ".synth.aiff")
+	defer os.Remove(tmpAIFF)
+	if out, err := exec.Command("say", "-v", "Samantha", "-r", "240", "-o", tmpAIFF, strings.TrimSpace(spoken)).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("say: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	af := "silenceremove=stop_periods=-1:stop_duration=0.08:stop_threshold=-35dB"
+	if tempo := cmp.Or(os.Getenv(envTempo), "2.0"); tempo != "1" {
+		af += ",atempo=" + tempo
+	}
+	stem := strings.TrimSuffix(filepath.Base(mdPath), filepath.Ext(mdPath))
+	outPCM := filepath.Join(stateDir, stem+".pcm")
+	if out, err := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-i", tmpAIFF, "-af", af, "-ar", "16000", "-ac", "1", "-f", "s16le", outPCM).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ffmpeg: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return outPCM, nil
+}
+
+var audioExts = map[string]bool{
+	".pcm": true, ".wav": true, ".mp3": true, ".aiff": true, ".aif": true,
+	".m4a": true, ".ogg": true, ".flac": true, ".aac": true,
+}
+
+func loadPrompt(path string) (compose.Prompt, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if audioExts[ext] {
+		return loadAudioPrompt(path, ext)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("system prompt file: %w", err)
+		return compose.Prompt{}, fmt.Errorf("system prompt file: %w", err)
 	}
 	b = []byte(strings.TrimPrefix(string(b), "\ufeff"))
 	if !utf8.Valid(b) {
-		return "", fmt.Errorf("system prompt file %s is not valid UTF-8", path)
+		return compose.Prompt{}, fmt.Errorf("system prompt file %s is not valid UTF-8", path)
 	}
 	if strings.TrimSpace(string(b)) == "" {
-		return "", fmt.Errorf("system prompt file %s is empty", path)
+		return compose.Prompt{}, fmt.Errorf("system prompt file %s is empty", path)
 	}
-	return string(b), nil
+	return compose.Prompt{Text: string(b)}, nil
+}
+
+func loadAudioPrompt(path, ext string) (compose.Prompt, error) {
+	var raw []byte
+	var err error
+	if ext == ".pcm" {
+		raw, err = os.ReadFile(path)
+	} else {
+		af := "silenceremove=stop_periods=-1:stop_duration=0.08:stop_threshold=-35dB"
+		if tempo := cmp.Or(os.Getenv(envTempo), "2.0"); tempo != "1" {
+			af += ",atempo=" + tempo
+		}
+		var stderr bytes.Buffer
+		cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-i", path, "-af", af, "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1")
+		cmd.Stderr = &stderr
+		if raw, err = cmd.Output(); err != nil {
+			return compose.Prompt{}, fmt.Errorf("audio prompt %s via ffmpeg: %w (%s)", path, err, strings.TrimSpace(stderr.String()))
+		}
+	}
+	if err != nil {
+		return compose.Prompt{}, fmt.Errorf("audio prompt file: %w", err)
+	}
+	if len(raw) == 0 {
+		return compose.Prompt{}, fmt.Errorf("audio prompt file %s is empty", path)
+	}
+	return compose.Prompt{MIMEType: "audio/pcm;rate=16000", Data: base64.StdEncoding.EncodeToString(raw)}, nil
 }
 
 func expand(p, home string) string {

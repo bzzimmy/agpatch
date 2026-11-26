@@ -17,8 +17,14 @@ If no prompt file is set, `agy-sp` execs the real `agy` with the same arguments 
 ## Usage
 
 ```sh
-agy-sp --system-prompt-file ~/prompts/me.md            # interactive
-agy-sp --system-prompt-file=me.md -p "do the thing"    # any other agy flags pass through
+agy sp set ~/prompts/me.md              # set persistent markdown prompt
+agy sp set ~/prompts/me.pcm             # set persistent audio prompt (.pcm/.mp3/.wav/.aiff/...)
+agy sp set --audio ~/prompts/me.md      # synthesize verbatim optimized 16kHz PCM from markdown & activate
+agy sp status                           # show active prompt
+agy sp clear                            # disable custom prompt (run stock agy)
+
+agy-sp --system-prompt-file ~/prompts/me.md            # one-off override (interactive)
+agy-sp --system-prompt-file=me.md -p "do the thing"    # one-off override (headless)
 ```
 
 The prompt file is resolved in this order, first match wins:

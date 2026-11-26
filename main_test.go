@@ -52,12 +52,38 @@ func TestLoadPrompt(t *testing.T) {
 	p := filepath.Join(d, "p.md")
 	os.WriteFile(p, []byte("\ufeff# Mine\n\nkeep  `this`\n"), 0o600)
 	got, err := loadPrompt(p)
-	if err != nil || got != "# Mine\n\nkeep  `this`\n" {
-		t.Fatalf("%q %v", got, err)
+	if err != nil || got.Text != "# Mine\n\nkeep  `this`\n" || got.Inline() {
+		t.Fatalf("%+v %v", got, err)
 	}
 	os.WriteFile(p, []byte(" \n\t\n"), 0o600)
 	if _, err := loadPrompt(p); err == nil {
 		t.Error("blank file accepted")
+	}
+	pcm := filepath.Join(d, "p.pcm")
+	os.WriteFile(pcm, []byte{1, 2, 3, 4}, 0o600)
+	gotPCM, err := loadPrompt(pcm)
+	if err != nil || gotPCM.MIMEType != "audio/pcm;rate=16000" || gotPCM.Data != "AQIDBA==" {
+		t.Fatalf("pcm: %+v %v", gotPCM, err)
+	}
+}
+
+func TestRunSPConfig(t *testing.T) {
+	d := t.TempDir()
+	cfg := filepath.Join(d, "agy-sp.json")
+	md := filepath.Join(d, "rules.md")
+	os.WriteFile(md, []byte("be terse\n"), 0o600)
+
+	if err := runSP([]string{"set", md}, d, d, cfg); err != nil {
+		t.Fatalf("set md: %v", err)
+	}
+	if got, err := configPromptPath(cfg); err != nil || got != md {
+		t.Fatalf("config after set: %q %v", got, err)
+	}
+	if err := runSP([]string{"clear"}, d, d, cfg); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if got, err := configPromptPath(cfg); err != nil || got != "" {
+		t.Fatalf("config after clear: %q %v", got, err)
 	}
 }
 

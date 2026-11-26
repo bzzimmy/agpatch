@@ -100,12 +100,19 @@ type Result struct {
 	Composed    string // the new system prompt text (only when Rewritten)
 }
 
-// Apply rewrites systemInstruction in a generateContent request body. Two
-// shapes are accepted: the Code Assist envelope {"request": {...}} and a bare
-// generateContent body. All bytes outside the systemInstruction value are kept
-// exactly as they were. On any unexpected shape the body is returned unchanged
-// with Rewritten=false.
+// Prompt is either plain user text or an inline media part placed ahead of harness text.
+type Prompt struct{ Text, MIMEType, Data string }
+
+func (p Prompt) Inline() bool { return p.MIMEType != "" }
+
+// Apply rewrites systemInstruction in a generateContent request body with plain user text.
 func Apply(body []byte, user string, opt Options) ([]byte, Result, error) {
+	return ApplyPrompt(body, Prompt{Text: user}, opt)
+}
+
+// ApplyPrompt rewrites systemInstruction in a generateContent request body
+// (Code Assist envelope or bare Vertex body), keeping all other bytes identical.
+func ApplyPrompt(body []byte, p Prompt, opt Options) ([]byte, Result, error) {
 	var res Result
 	reqStart, reqEnd, hasReq, err := member(body, 0, "request")
 	if err != nil {
@@ -156,11 +163,22 @@ func Apply(body []byte, user string, opt Options) ([]byte, Result, error) {
 			return body, skip(res, "not an agent turn (no labels.cascade_id)"), err
 		}
 	}
-	if IsComposed(harness, user) {
-		return body, skip(res, "already composed"), nil
+	var composed string
+	var parts any
+	if p.Inline() {
+		composed = strings.TrimLeft(Compose("", harness), "\n")
+		parts = []any{
+			map[string]any{"inlineData": map[string]string{"mimeType": p.MIMEType, "data": p.Data}},
+			map[string]string{"text": composed},
+		}
+	} else {
+		if IsComposed(harness, p.Text) {
+			return body, skip(res, "already composed"), nil
+		}
+		composed = Compose(p.Text, harness)
+		parts = []map[string]string{{"text": composed}}
 	}
-	composed := Compose(user, harness)
-	newSI, err := replaceParts(si, composed)
+	newSI, err := replaceParts(si, parts)
 	if err != nil {
 		return body, skip(res, "cannot rebuild systemInstruction"), err
 	}
@@ -170,7 +188,7 @@ func Apply(body []byte, user string, opt Options) ([]byte, Result, error) {
 	out = append(out, newSI...)
 	out = append(out, body[abs1:]...)
 	res.Rewritten, res.Reason = true, "ok"
-	res.ComposedLen, res.Composed = len(composed), composed
+	res.ComposedLen, res.Composed = len(p.Data)+len(composed), composed
 	return out, res, nil
 }
 
@@ -285,9 +303,9 @@ func textOf(si []byte) (string, error) {
 }
 
 // replaceParts re-emits the Content object with its members in their original
-// order, swapping only "parts" for a single text part.
-func replaceParts(si []byte, text string) ([]byte, error) {
-	parts, err := marshalNoEscape([]map[string]string{{"text": text}})
+// order, swapping only "parts" for the given marshaled parts slice.
+func replaceParts(si []byte, partsVal any) ([]byte, error) {
+	parts, err := marshalNoEscape(partsVal)
 	if err != nil {
 		return nil, err
 	}
